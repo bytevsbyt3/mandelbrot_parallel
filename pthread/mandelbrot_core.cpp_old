@@ -1,0 +1,175 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <pthread.h>
+#include "../common/mandelbrot.h"
+
+
+enum THREAD_CMD {PAUSE,COMPUTE};
+static enum THREAD_CMD *workstates = NULL;
+static int n_workers = 0;
+static int n_threads = 8;
+static int points_thread_max;
+static int dothings = TRUE;
+static complex_t julia_c = {JULIA_C_REAL, JULIA_C_IMAG};
+static void (*function_p_calc)(complex_t *, int *, int, int, zoominfo_t);
+static pthread_t *threads;
+static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t workerlock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t condition = PTHREAD_COND_INITIALIZER;
+
+
+void mandelbrot_calc(complex_t *mat, int *iterations, int idxoffset, int n_points, zoominfo_t zinfo){
+    complex_t z, c;
+    double rnew;
+    int idxmat = idxoffset;
+    int i = idxmat / width;
+    int j = idxmat % width;
+    while(idxmat < idxoffset + n_points){
+        int iter = 0;
+        z.r = 0; z.i = 0;
+        c.r = ((double)(j - width/2 + zinfo.start_x))/zinfo.ratio;
+        c.i = ((double)(i - height/2 + zinfo.start_y))/zinfo.ratio;
+        while(iter < max_iter && (z.r*z.r + z.i*z.i) <= 4.0) {
+            rnew = (z.r * z.r) - (z.i * z.i) + c.r;
+            z.i = 2 * (z.r) * (z.i) + c.i;
+            z.r = rnew;
+            iter++;
+        }
+        mat[idxmat].r = z.r;
+        mat[idxmat].i = z.i;
+        if(iter == max_iter) iterations[idxmat] = -1;  //dentro insieme
+        else iterations[idxmat] = iter;
+        ++idxmat; ++j;
+        if(j == width){
+            j = 0;
+            i++;
+        }
+    }
+}
+
+void julia_calc(complex_t *mat, int *iterations, int idxoffset, int n_points, zoominfo_t zinfo){
+    complex_t z, c;
+    double rnew;
+    c = julia_c;
+    int idxmat = idxoffset;
+    int i = idxmat / width;
+    int j = idxmat % width;
+    while(idxmat < idxoffset + n_points){
+        int iter = 0;
+        z.r = ((double)(j - width/2 + zinfo.start_x))/zinfo.ratio;
+        z.i = ((double)(i - height/2 + zinfo.start_y))/zinfo.ratio;
+        while(iter < max_iter && (z.r*z.r + z.i*z.i) <= 4.0){
+            rnew = (z.r * z.r) - (z.i * z.i) + c.r;
+            z.i = 2 * (z.r) * (z.i) + c.i;
+            z.r = rnew;
+            iter++;
+        }
+        mat[idxmat].r = z.r;
+        mat[idxmat].i = z.i;
+        if(iter == max_iter) iterations[idxmat] = -1;  //dentro insieme
+        else iterations[idxmat] = iter;
+        ++idxmat; ++j;
+        if(j == width){
+            j = 0;
+            i++;
+        }
+    }
+}
+
+
+void *run(void *data){
+    int tid = (int)(long)data;
+    int size = width * height;
+    int idxoffset, n_points;
+    idxoffset = tid * points_thread_max;
+    if(tid == n_threads-1) n_points = size - idxoffset;
+    else n_points = points_thread_max;
+    //printf("[%d] npoints: %d, offset: %d\n", tid, n_points, idxoffset);
+    pthread_mutex_lock(&mutex);
+    while(dothings){
+        while(workstates[tid] != COMPUTE){
+            //printf("[%d]waiting\n", tid);
+            pthread_cond_wait(&condition, &mutex);
+            //printf("[%d]signaled\n", tid);
+        }
+        pthread_mutex_unlock(&mutex);
+        // no critical section
+        function_p_calc(matrix, iterations, idxoffset, n_points, zoom_info);
+        workstates[tid] = PAUSE;
+        pthread_mutex_lock(&workerlock);
+        n_workers--;
+        if(n_workers == 0){
+            //printf("[%d]signaling main\n", tid);
+            pthread_cond_broadcast(&condition);     //metti signal
+        }
+        pthread_mutex_unlock(&workerlock);
+        pthread_mutex_lock(&mutex);
+    }
+    pthread_mutex_unlock(&mutex);
+    pthread_exit(NULL);
+}
+
+static inline int is_alldone(){
+    for(int i=0; i < n_threads; i++){
+        if(workstates[i] == COMPUTE)
+            return FALSE;
+    }
+    return TRUE;
+}
+
+static inline void set_workstates(enum THREAD_CMD val){
+    for(int i = 0; i < n_threads; i++){
+        workstates[i] = val;
+    }
+}
+
+
+
+void core_init(void **args){
+    if(args[ARG_NUMP] != NULL)
+        n_threads = (int)strtol((char*)args[ARG_NUMP], NULL, 10);
+    points_thread_max = (width*height) / n_threads;
+    if(args[ARG_JULY]){
+        function_p_calc = julia_calc;
+        if(args[ARG_JULR] != NULL && args[ARG_JULI] != NULL){
+            julia_c.r = strtod((char*)args[ARG_JULR], NULL);
+            julia_c.i = strtod((char*)args[ARG_JULI], NULL);
+        }
+    }
+    else{
+        function_p_calc = mandelbrot_calc;
+    }
+    threads = (pthread_t*) malloc(sizeof(pthread_t) * n_threads);
+    workstates = (THREAD_CMD*) malloc(sizeof(enum THREAD_CMD) * n_threads);
+    set_workstates(PAUSE);
+    for(long i = 0; i < n_threads; i++){
+        if(pthread_create(&threads[i], NULL, run, (void*)i) != 0){
+            exit(1);
+        }
+    }
+}
+
+void core_computation(){
+    // ALL IN CRITICAL SECTION
+    pthread_mutex_lock(&mutex);
+    set_workstates(COMPUTE);
+    n_workers = n_threads;
+    while(is_alldone() == FALSE){
+        //printf("[main]paint, cond lock\n");
+        pthread_cond_broadcast(&condition);
+        pthread_cond_wait(&condition, &mutex);
+    }
+    pthread_mutex_unlock(&mutex);
+}
+
+void core_exit(void **data){
+    dothings = 0;
+    set_workstates(COMPUTE);
+    pthread_cond_broadcast(&condition);
+    for(int i = 0; i < n_threads; i++){
+        pthread_join(threads[i], NULL);
+    }
+    free(threads);
+}

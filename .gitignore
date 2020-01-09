@@ -1,0 +1,7 @@
+mandelseq
+mandelpth
+mandelgpu
+mandelmpi
+mandelgpu_cu8
+*.o
+*.data
